@@ -531,3 +531,84 @@ class GridTracksResponse(BaseModel):
     container_overflow: float  # used_width 超出容器宽度的部分（否则 0）
     overflow: list[GridOverflowOut] = Field(default_factory=list)
     trace: list[GridTraceStepOut] = Field(default_factory=list)
+
+
+# ---------- POST /color-mix ----------
+
+
+ColorMixSpace = Literal["srgb", "srgb-linear", "hsl", "oklab", "oklch"]
+HueInterpolation = Literal["shorter", "longer", "increasing", "decreasing"]
+
+
+class ColorMixRequest(BaseModel):
+    """color-mix() 风格的两色混合请求。
+
+    color_a / color_b 接受 hex（#rgb/#rgba/#rrggbb/#rrggbbaa）、
+    rgb()/rgba()、hsl()/hsla()；weight_a / weight_b 为百分比数值（如 30），
+    均省略时各取 50，只省略一个时补到 100。interpolation_space 缺省 oklab；
+    hue_interpolation 仅在极坐标空间（hsl / oklch）下有效，缺省 shorter。
+    """
+
+    color_a: str
+    color_b: str
+    weight_a: Optional[float] = None
+    weight_b: Optional[float] = None
+    interpolation_space: ColorMixSpace = "oklab"
+    hue_interpolation: Optional[HueInterpolation] = None
+
+
+class ColorMixInputOut(BaseModel):
+    """一侧输入色的解析结果。"""
+
+    raw: str
+    syntax: str  # hex / rgb / hsl
+    given_weight: Optional[float]  # 请求中给定的权重（null 为省略）
+    normalized_weight: float  # 归一化后的最终权重
+    srgb: list[float]  # 该色在 sRGB 中的分量（0..1，未裁剪）
+    alpha: float
+
+
+class ColorMixNodeOut(BaseModel):
+    """转换轨迹中的一个空间节点。
+
+    space 为空间名；coords 为该空间坐标（缺失分量为 null）；alpha 为该
+    节点处 alpha；premultiplied 标记 coords 是否已乘 alpha。
+    """
+
+    space: str
+    coords: list[Optional[float]]
+    missing: list[bool]
+    alpha: float
+    premultiplied: bool = False
+
+
+class ColorMixInterpolationOut(BaseModel):
+    """插值空间中的完整处理记录。
+
+    start / end：两侧在目标空间的起点 / 终点节点（先转换，再预乘 alpha）；
+    hue_adjustment：极坐标空间的 hue 调整记录（矩形空间为 null）；
+    mixed：插值后、未还原预乘的目标空间节点；
+    result：还原预乘并应用权重和缩放后的目标空间节点。
+    """
+
+    space: str
+    hue_interpolation: Optional[str]
+    start: ColorMixNodeOut
+    end: ColorMixNodeOut
+    hue_adjustment: Optional[dict] = None
+    mixed: ColorMixNodeOut
+    result: ColorMixNodeOut
+
+
+class ColorMixResponse(BaseModel):
+    color_a: ColorMixInputOut
+    color_b: ColorMixInputOut
+    weights: dict  # 权重补齐、归一化与权重和缩放的说明与数值
+    interpolation_space: str
+    hue_interpolation: Optional[str]
+    conversions: list[ColorMixNodeOut]  # 两侧「输入空间 -> sRGB -> 目标空间」的完整转换轨迹
+    interpolation: ColorMixInterpolationOut
+    back_conversion: list[ColorMixNodeOut]  # 目标空间 -> sRGB 的逐跳坐标
+    clipped: list[bool]  # 各 sRGB 通道在转回后是否被裁剪
+    rgba: dict  # 最终 rgba：整数 r/g/b（0..255）、alpha（0..1）与 css 字符串
+    trace: list[str]  # 中文逐步轨迹

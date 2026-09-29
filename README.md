@@ -17,6 +17,7 @@ docker compose up --build
 - `POST /counter-render` — CSS 计数器元素树渲染（counter-reset/set/increment 与 counter()/counters()）
 - `POST /math-evaluate` — CSS 数学表达式求值（calc/min/max/clamp 与四则运算）
 - `POST /grid-tracks` — 单行 CSS Grid 列宽求解（px/%/fr/minmax 轨道与项目 min_content）
+- `POST /color-mix` — 按 CSS Color 规则混合两种颜色（srgb/srgb-linear/hsl/oklab/oklch 与 hue 弧线）
 - `GET /health` — 健康检查
 - `GET /docs` — Swagger UI 交互文档
 
@@ -728,7 +729,133 @@ curl -X POST http://localhost:8000/grid-tracks \
   `start + span - 1` 超出列数越界；
 - `columns` 为空。
 
-## 请求模型
+## POST /color-mix：按 CSS Color 规则混合两种颜色
+
+按 CSS Color 4/5 的 `color-mix()` 语义混合两种颜色。输入颜色接受：
+
+- hex：`#rgb` / `#rgba` / `#rrggbb` / `#rrggbbaa`（大小写不敏感）；
+- `rgb()` / `rgba()`：旧式逗号语法（`rgba(255, 0, 0, 0.5)`）与现代空格 +
+  斜杠语法（`rgb(255 0 0 / 50%)`），通道可同为 0–255 数值或同为百分比；
+- `hsl()` / `hsla()`：`hsl(240, 100%, 50%)` 或 `hsl(0.5turn 100% 50% / .5)`，
+  hue 支持 `deg` / `rad` / `grad` / `turn`，hue 也可写 `none` 表示缺失。
+
+请求字段：`color_a`、`color_b`（必填）、`weight_a` / `weight_b`（可选百分比数值）、
+`interpolation_space`（`srgb` / `srgb-linear` / `hsl` / `oklab` / `oklch`，
+缺省 `oklab`）、`hue_interpolation`（仅极坐标空间 `hsl` / `oklch` 可用：
+`shorter` / `longer` / `increasing` / `decreasing`，缺省 `shorter`）。
+
+8000 端口示例（请求体见 `examples/color-mix.json`）：
+
+```bash
+curl -X POST http://localhost:8000/color-mix \
+  -H 'Content-Type: application/json' \
+  -d @examples/color-mix.json
+```
+
+### 权重规则
+
+- 两个权重都省略时各取 **50%**；只省略一个时补到 **100%**（如 `weight_a=25`
+  则 B 为 75%；补出负值返回 422）；
+- 给定的权重按**和归一化**（和 120% 时 30/90 → 0.25/0.75）；
+- 权重和**小于 100%** 时，结果 alpha 同比乘以「和 / 100」（如 20%+30% 时
+  alpha 再乘 0.5）；和不少于 100% 时不缩放；
+- 负权重或权重和为 0 返回 422。
+
+### 转换、插值与 hue 弧线
+
+两侧颜色先逐跳转换到目标插值空间（经 sRGB 与 linear-sRGB 中转，完整坐标轨迹
+见响应的 `conversions`），颜色通道以**预乘 alpha** 线性插值（hue 通道不预乘），
+alpha 本身按权重插值；插值后还原预乘，再经 `back_conversion` 转回 sRGB，
+超出 `[0,1]` 的通道**逐通道裁剪**（`clipped` 逐通道标记）。
+
+极坐标空间（`hsl` / `oklch`）按 CSS Color 4 处理 hue：
+
+- `shorter`（缺省）：取小于 180° 的弧；`longer`：取大于 180° 的弧
+  （两侧 hue 相同也绕整周）；
+- `increasing`：终点 hue 单调不减；`decreasing`：终点 hue 单调不增；
+- 无彩色一侧（hsl 的 `s=0` 或 `l=0%/100%`、oklch 的 `c=0`）**缺失 hue**
+  取另一侧 hue；两侧都缺失时按 0° 处理且结果 hue 仍缺失。
+
+例如 sRGB 空间 50% 红 + 50% 蓝：
+
+```bash
+curl -X POST http://localhost:8000/color-mix \
+  -H 'Content-Type: application/json' \
+  -d '{"color_a": "#ff0000", "color_b": "#0000ff",
+       "interpolation_space": "srgb"}'
+```
+
+响应（节选）：
+
+```json
+{
+  "color_a": {"raw": "#ff0000", "syntax": "hex", "given_weight": null,
+              "normalized_weight": 0.5, "srgb": [1.0, 0.0, 0.0],
+              "alpha": 1.0},
+  "color_b": {"raw": "#0000ff", "syntax": "hex", "given_weight": null,
+              "normalized_weight": 0.5, "srgb": [0.0, 0.0, 1.0],
+              "alpha": 1.0},
+  "weights": {"given": [null, null], "completed": [50.0, 50.0], "sum": 100.0,
+              "normalized": [0.5, 0.5], "alpha_scale": 1.0},
+  "interpolation_space": "srgb",
+  "hue_interpolation": null,
+  "conversions": [
+    {"space": "srgb", "coords": [1.0, 0.0, 0.0], "missing": [false, false, false],
+     "alpha": 1.0, "premultiplied": false},
+    {"space": "srgb", "coords": [0.0, 0.0, 1.0], "missing": [false, false, false],
+     "alpha": 1.0, "premultiplied": false}
+  ],
+  "interpolation": {
+    "space": "srgb", "hue_interpolation": null,
+    "start": {"space": "srgb", "coords": [1.0, 0.0, 0.0],
+              "missing": [false, false, false], "alpha": 1.0, "premultiplied": true},
+    "end": {"space": "srgb", "coords": [0.0, 0.0, 1.0],
+            "missing": [false, false, false], "alpha": 1.0, "premultiplied": true},
+    "hue_adjustment": null,
+    "mixed": {"space": "srgb", "coords": [0.5, 0.0, 0.5],
+              "missing": [false, false, false], "alpha": 1.0, "premultiplied": true},
+    "result": {"space": "srgb", "coords": [0.5, 0.0, 0.5],
+               "missing": [false, false, false], "alpha": 1.0, "premultiplied": false}
+  },
+  "back_conversion": [
+    {"space": "srgb", "coords": [0.5, 0.0, 0.5], "missing": [false, false, false],
+     "alpha": 1.0, "premultiplied": false}
+  ],
+  "clipped": [false, false, false],
+  "rgba": {"r": 128, "g": 0, "b": 128, "alpha": 1.0,
+           "css": "rgba(128, 0, 128, 1)",
+           "srgb_unclamped": [0.5, 0.0, 0.5], "srgb": [0.5, 0.0, 0.5]},
+  "trace": [
+    "两个权重均省略：各取 50%",
+    "给定权重 50% / 50%（和 100%）按和归一化：0.500000 / 0.500000",
+    "权重和不少于 100%：alpha 不再缩放",
+    "解析颜色 A '#ff0000'（hex）：sRGB=(1.0, 0.0, 0.0)，alpha=1",
+    "解析颜色 B '#0000ff'（hex）：sRGB=(0.0, 0.0, 1.0)，alpha=1",
+    "插值空间：srgb；hue 弧线：shorter",
+    "颜色 A 经 srgb 转换到 srgb，坐标 [1.0, 0.0, 0.0]",
+    "颜色 B 经 srgb 转换到 srgb，坐标 [0.0, 0.0, 1.0]",
+    "预乘 alpha 后按 0.500000/0.500000 线性插值：[1.0, 0.0, 0.0] -> [0.0, 0.0, 1.0]，混合得 [0.5, 0.0, 0.5]（alpha=1）",
+    "还原预乘：目标空间坐标 [0.5, 0.0, 0.5]，alpha=1",
+    "转回 sRGB：[0.5, 0.0, 0.5]（无需裁剪）"
+  ]
+}
+```
+
+不同插值空间给出不同结果：同样的红 + 蓝中点，`srgb` 为 `rgb(128 0 128)`、
+`srgb-linear` 为 `rgb(188 0 188)`（线性光中点更亮）、缺省 `oklab` 为
+`rgb(140 83 162)`。hsl 空间中 `hsl(0 100% 50%)` 与 `hsl(240 100% 50%)`：
+`shorter` 经品红（中点 hue 300°），`longer` 经绿（中点 hue 120°）。
+
+### 校验（HTTP 422）
+
+以下情况返回 422 并在 `detail` 中说明原因：
+
+- 颜色不是合法 hex / `rgb()` / `rgba()` / `hsl()` / `hsla()`（含长度非法的
+  hex、参数个数错误、rgb 通道数值 / 百分比混用、s/l 非百分比、未知颜色函数）；
+- 权重为负、非有限值，补齐后权重为负（给定一侧超过 100%），或权重和为 0；
+- 在矩形空间（`srgb` / `srgb-linear` / `oklab`）指定 `hue_interpolation`。
+
+## /compute 请求模型
 
 | 字段 | 说明 |
 | --- | --- |
@@ -778,7 +905,8 @@ curl -X POST http://localhost:8000/grid-tracks \
 app/
   main.py       FastAPI 入口（POST /compute、POST /selector-overlap、
                 POST /keyframe-sample、POST /counter-render、
-                POST /math-evaluate、POST /grid-tracks、GET /health）
+                POST /math-evaluate、POST /grid-tracks、POST /color-mix、
+                GET /health）
   models.py     请求 / 响应模型
   selector.py   选择器解析与匹配、特异性计算
   overlap.py    选择器可命中性对齐搜索与冲突诊断
@@ -789,6 +917,8 @@ app/
                 单位换算、维度规则与逐节点求值轨迹
   grid_tracks.py 单行 Grid 列宽：轨道解析、min_content 缺口等额分摊
                 （触顶份额回流）与 fr 剩余空间迭代分配（低份额轨道先固定）
+  color_mix.py  两色混合：hex/rgb/hsl 解析、sRGB/线性 sRGB/HSL/OKLab/OKLCH
+                转换、预乘 alpha 插值、hue 弧线与逐通道裁剪
   cascade.py    层叠排序键与淘汰证据生成
   variables.py  var() 解析替换、自定义属性继承与循环检测
   engine.py     计算编排
@@ -798,11 +928,13 @@ tests/test_keyframe.py    /keyframe-sample 端到端测试
 tests/test_counters.py    /counter-render 端到端测试
 tests/test_math_eval.py   /math-evaluate 端到端测试
 tests/test_grid_tracks.py /grid-tracks 端到端测试
+tests/test_color_mix.py   /color-mix 端到端测试
 examples/request.json          /compute 示例请求
 examples/keyframe-sample.json  /keyframe-sample 示例请求
 examples/counter-render.json   /counter-render 示例请求
 examples/math-evaluate.json    /math-evaluate 示例请求
 examples/grid-tracks.json      /grid-tracks 示例请求
+examples/color-mix.json        /color-mix 示例请求
 Dockerfile / docker-compose.yml
 ```
 
