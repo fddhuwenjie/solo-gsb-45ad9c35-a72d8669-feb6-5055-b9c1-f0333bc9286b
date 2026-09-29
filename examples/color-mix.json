@@ -1,0 +1,7 @@
+{
+  "color_a": "rgb(255 0 0 / 0.8)",
+  "color_b": "#0000ff",
+  "weight_a": 60,
+  "interpolation_space": "oklch",
+  "hue_interpolation": "shorter"
+}

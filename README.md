@@ -17,6 +17,7 @@ docker compose up --build
 - `POST /counter-render` — CSS 计数器元素树渲染（counter-reset/set/increment 与 counter()/counters()）
 - `POST /math-evaluate` — CSS 数学表达式求值（calc/min/max/clamp 与四则运算）
 - `POST /grid-tracks` — 单行 CSS Grid 列宽求解（px/%/fr/minmax 轨道与项目 min_content）
+- `POST /color-mix` — 按 CSS Color 规则在 srgb / srgb-linear / hsl / oklab / oklch 空间混合两色
 - `GET /health` — 健康检查
 - `GET /docs` — Swagger UI 交互文档
 
@@ -728,6 +729,148 @@ curl -X POST http://localhost:8000/grid-tracks \
   `start + span - 1` 超出列数越界；
 - `columns` 为空。
 
+## POST /color-mix：CSS Color 两色混合
+
+按 CSS Color 4 插值与 CSS Color 5 `color-mix()` 规则混合两种颜色：输入接受
+hex 与 `rgb()`/`rgba()`/`hsl()`/`hsla()`，在 `srgb`、`srgb-linear`、`hsl`、
+`oklab`、`oklch` 五种插值空间之一中按预乘 alpha 线性插值，极坐标空间
+（`hsl`/`oklch`）支持 `shorter` / `longer` / `increasing` / `decreasing`
+四种 hue 弧线，结果转回 sRGB 后逐通道裁剪。响应给出最终 rgba、目标空间
+坐标与权重，以及完整的转换、hue 修正与插值轨迹。
+
+8000 端口示例（请求体见 `examples/color-mix.json`）：
+
+```bash
+curl -X POST http://localhost:8000/color-mix \
+  -H 'Content-Type: application/json' \
+  -d @examples/color-mix.json
+```
+
+```json
+{
+  "color_a": "rgb(255 0 0 / 0.8)",
+  "color_b": "#0000ff",
+  "weight_a": 60,
+  "interpolation_space": "oklch",
+  "hue_interpolation": "shorter"
+}
+```
+
+响应节选：
+
+```json
+{
+  "space": "oklch",
+  "hue_interpolation": "shorter",
+  "weights": {
+    "given": [60.0, null],
+    "resolved": [60.0, 40.0],
+    "sum_percent": 100.0,
+    "normalized": [0.6, 0.4],
+    "alpha_scale": 1.0
+  },
+  "conversions": [
+    {"input": "rgb(255 0 0 / 0.8)", "format": "rgb", "alpha": 0.8,
+     "steps": ["rgb() 分量归一化为 sRGB（0–255 / 百分比统一为 0–1）",
+               "sRGB 去伽马转为线性光 sRGB",
+               "线性 sRGB 经 D65 矩阵转换为 CIE XYZ",
+               "XYZ 经 LMS 非线性压缩转换为 OKLab",
+               "OKLab 直角坐标极坐标化为 OKLCh（C=hypot(a,b)，h=atan2(b,a)）"],
+     "coords": [0.627955, 0.257683, 29.23388]},
+    {"input": "#0000ff", "format": "hex", "alpha": 1.0, "coords": [0.452014, 0.313214, 264.052023]}
+  ],
+  "interpolation": {
+    "space": "oklch",
+    "premultiplied": [[0.502364, 0.206147, 29.23388, 0.8],
+                      [0.452014, 0.313214, -95.947977, 1.0]],
+    "hue_fixup": "shorter：hue 差小于 -180°，color_b 的 hue 减 360° 取短弧",
+    "missing_hue": null,
+    "mixed_coords": [0.547982, 0.282925, 339.161137]
+  },
+  "coords": [0.547982, 0.282925, 339.161137],
+  "rgba": {"r": 204, "g": 0, "b": 165, "alpha": 0.88,
+           "css": "rgb(204 0 165 / 0.88)"}
+}
+```
+
+### 请求字段
+
+| 字段 | 说明 |
+| --- | --- |
+| `color_a` / `color_b` | 输入颜色：`#rgb` / `#rgba` / `#rrggbb` / `#rrggbbaa`，或 `rgb()/rgba()/hsl()/hsla()`；函数式兼容传统逗号（`rgba(1,2,3,.5)`）与现代空格 + 斜杠 alpha（`rgb(1 2 3 / 50%)`）两种写法；hsl 的色相支持裸数字（按度）与 `deg/rad/grad/turn` 单位，s/l 必须为百分比 |
+| `weight_a` / `weight_b` | 百分比权重，数字（`70`）或字符串（`"70%"`）均可；省略规则见下 |
+| `interpolation_space` | `srgb`（默认）/ `srgb-linear` / `hsl` / `oklab` / `oklch` |
+| `hue_interpolation` | 仅极坐标空间可用：`shorter`（默认）/ `longer` / `increasing` / `decreasing` |
+
+### 权重规则
+
+- 两个权重都省略：各取 50%；只省略一个：另一个补到 100%（如只给
+  `weight_a=70`，则 b 取 30）；
+- 给定权重之和先归一化作为插值比例（60% 与 20% 归一为 0.75 / 0.25）；
+- 权重和**低于 100%** 时，按 `min(1, 和 / 100)` **同比缩小结果 alpha**
+  （颜色通道仍按归一化比例混合），对应与透明色混合的 CSS 语义；
+- 权重为负（含补全后为负）、和为 0 或和超过 100% 均为 422。
+
+### 插值规则
+
+1. 两色先经 sRGB 中转转换到目标空间（`hsl()` 输入先到 sRGB，再按空间
+   需要去伽马 / 经 XYZ 转 OKLab/OKLCh），逐步说明见 `conversions[].steps`；
+2. 极坐标空间先处理**缺失 hue**：在目标空间无彩色的一侧（hsl 中 s=0、
+   oklch 中 C≈0，如灰、白、黑）借用另一侧 hue；两侧都无彩色则 hue 同取 0；
+3. 再按 hue 弧线修正：`shorter` 取 ≤180° 的弧、`longer` 取 ≥180° 的弧，
+   `increasing` 保持 hue 单调增大、`decreasing` 单调减小（通过给 color_b
+   的 hue 加减 360° 表达绕行方向，插值后折回 [0,360)）；
+4. 颜色通道**预乘 alpha** 后按归一化权重线性插值（极坐标 hue 不预乘），
+   再除以混合 alpha 还原；预乘前后的坐标见
+   `interpolation.premultiplied[]`；
+5. 经 `back_convert_steps` 转回 sRGB，**逐通道裁剪**到 [0,255]；最终
+   `rgba.r/g/b` 为 CSS 序列化的 8-bit 整数（`floor(x+0.5)`），
+   `rgba.alpha` 为 0–1，`rgba.css` 为 `rgb(r g b / a)` 字符串。
+
+`coords` 与轨迹坐标按空间采用展示单位：`srgb` 为 0–255；`hsl` 为
+`[h 度, s %, l %]`；`srgb-linear` / `oklab` / `oklch` 为规范内部单位
+（oklch 为 `[L, C, h 度]`），均保留 6 位小数。
+
+### 示例：低权重和缩小 alpha 与无彩色 hue 借用
+
+```bash
+curl -X POST http://localhost:8000/color-mix \
+  -H 'Content-Type: application/json' \
+  -d '{"color_a":"#ff0000","color_b":"#0000ff","weight_a":"30%","weight_b":"20%"}'
+```
+
+权重归一化为 0.6 / 0.4，alpha 乘 0.5：
+
+```json
+{"weights": {"sum_percent": 50.0, "normalized": [0.6, 0.4], "alpha_scale": 0.5},
+ "rgba": {"r": 153, "g": 0, "b": 102, "alpha": 0.5,
+          "css": "rgb(153 0 102 / 0.5)"}}
+```
+
+白色（无彩色）在 oklch 中与红色混合时，白色缺失的 hue 借用红色 hue，
+插值沿固定色相 29.23° 进行而不会扫过一圈：
+
+```bash
+curl -X POST http://localhost:8000/color-mix \
+  -H 'Content-Type: application/json' \
+  -d '{"color_a":"#ffffff","color_b":"#ff0000","interpolation_space":"oklch"}'
+# interpolation.missing_hue: "color_a 无彩色（缺失 hue），借用 color_b 的 hue"
+# coords[2]（hue）恒为 29.23388
+```
+
+### 校验（HTTP 422）
+
+以下情况返回 422 并在 `detail` 中说明原因：
+
+- 颜色无法识别（关键字如 `red`、非法 hex、未知函数）、函数参数个数错误、
+  逗号式与空格 / 斜杠式混用、rgb 通道数字与百分比混用、hsl 的 s/l 不是
+  百分比、色相角单位非法、任何数值为 `NaN` / `Infinity`；
+- 权重为负（含只给一个时补全为负）、权重和为 0、权重和超过 100%，或
+  权重不是数字 / 百分比字符串（含布尔值）；
+- `interpolation_space` 不在五个支持空间内；
+- 在非极坐标空间（`srgb` / `srgb-linear` / `oklab`）指定
+  `hue_interpolation`，或弧线名不在四种之内。
+
 ## 请求模型
 
 | 字段 | 说明 |
@@ -778,7 +921,8 @@ curl -X POST http://localhost:8000/grid-tracks \
 app/
   main.py       FastAPI 入口（POST /compute、POST /selector-overlap、
                 POST /keyframe-sample、POST /counter-render、
-                POST /math-evaluate、POST /grid-tracks、GET /health）
+                POST /math-evaluate、POST /grid-tracks、POST /color-mix、
+                GET /health）
   models.py     请求 / 响应模型
   selector.py   选择器解析与匹配、特异性计算
   overlap.py    选择器可命中性对齐搜索与冲突诊断
@@ -789,6 +933,9 @@ app/
                 单位换算、维度规则与逐节点求值轨迹
   grid_tracks.py 单行 Grid 列宽：轨道解析、min_content 缺口等额分摊
                 （触顶份额回流）与 fr 剩余空间迭代分配（低份额轨道先固定）
+  color_mix.py  CSS Color 两色混合：hex/rgb/hsl 解析、srgb/线性光/
+                hsl/oklab/oklch 空间转换（D65 矩阵、OKLab LMS 压缩）、
+                权重归一化与 alpha 缩放、极坐标 hue 弧线与预乘插值
   cascade.py    层叠排序键与淘汰证据生成
   variables.py  var() 解析替换、自定义属性继承与循环检测
   engine.py     计算编排
@@ -798,11 +945,13 @@ tests/test_keyframe.py    /keyframe-sample 端到端测试
 tests/test_counters.py    /counter-render 端到端测试
 tests/test_math_eval.py   /math-evaluate 端到端测试
 tests/test_grid_tracks.py /grid-tracks 端到端测试
+tests/test_color_mix.py   /color-mix 端到端测试
 examples/request.json          /compute 示例请求
 examples/keyframe-sample.json  /keyframe-sample 示例请求
 examples/counter-render.json   /counter-render 示例请求
 examples/math-evaluate.json    /math-evaluate 示例请求
 examples/grid-tracks.json      /grid-tracks 示例请求
+examples/color-mix.json        /color-mix 示例请求
 Dockerfile / docker-compose.yml
 ```
 

@@ -531,3 +531,96 @@ class GridTracksResponse(BaseModel):
     container_overflow: float  # used_width 超出容器宽度的部分（否则 0）
     overflow: list[GridOverflowOut] = Field(default_factory=list)
     trace: list[GridTraceStepOut] = Field(default_factory=list)
+
+
+# ---------- POST /color-mix ----------
+
+# 插值色彩空间：直角坐标 srgb / srgb-linear / oklab，
+# 极坐标（hue 通道）hsl / oklch
+ColorSpace = Literal["srgb", "srgb-linear", "hsl", "oklab", "oklch"]
+HueArc = Literal["shorter", "longer", "increasing", "decreasing"]
+
+
+class ColorMixRequest(BaseModel):
+    """CSS color-mix() 风格的两色混合请求。
+
+    color_a / color_b 接受 hex（#rgb/#rgba/#rrggbb/#rrggbbaa）与
+    rgb()/rgba()/hsl()/hsla()（传统逗号式或现代空格 + 斜杠 alpha 式）。
+    weight_a / weight_b 为百分比，可写数字（70）或字符串（"70%"）：
+    两者省略各取 50，仅给一个时另一个补到 100。
+    interpolation_space 为插值空间；hue_interpolation 指定极坐标空间的
+    hue 弧线（非极坐标空间不允许指定）。
+    """
+
+    color_a: str
+    color_b: str
+    weight_a: Optional[Union[float, str]] = None
+    weight_b: Optional[Union[float, str]] = None
+    interpolation_space: ColorSpace = "srgb"
+    hue_interpolation: Optional[HueArc] = None
+
+    @field_validator("weight_a", "weight_b", mode="before")
+    @classmethod
+    def _reject_bool_weight(cls, v):
+        # 与其他数值字段同理：布尔值不能隐式当作 0 / 1
+        if isinstance(v, bool):
+            raise ValueError("权重不能是布尔值")
+        return v
+
+
+class ColorMixRgbaOut(BaseModel):
+    """混合结果的 sRGB 分量：r/g/b 为 0–255 的 8-bit 整数（CSS rgb()
+    序列化四舍五入），alpha 为 0–1。"""
+
+    r: int
+    g: int
+    b: int
+    alpha: float
+    css: str  # 序列化字符串，如 "rgb(128 64 0 / 0.5)"
+
+
+class ColorMixWeightsOut(BaseModel):
+    """权重归一化过程。
+
+    given：请求中给定的权重（未给为 null）；resolved：补全到 100 后的
+    两边权重；normalized：除以总和后用于插值的比例；sum_percent 为给定
+    权重之和；alpha_scale 为权重和低于 100% 时同比缩小结果 alpha 的系数
+    （min(1, sum_percent / 100)）。
+    """
+
+    given: list[Optional[float]]
+    resolved: list[float]
+    sum_percent: float
+    normalized: list[float]
+    alpha_scale: float
+
+
+class ColorMixConvertOut(BaseModel):
+    """一种输入颜色到插值空间的转换轨迹。"""
+
+    input: str
+    format: str  # hex / rgb / hsl
+    alpha: float
+    steps: list[str] = Field(default_factory=list)
+    coords: list[float]  # 在插值空间内的坐标（hsl 用百分比、oklch h 用度）
+
+
+class ColorMixInterpolationOut(BaseModel):
+    """插值阶段轨迹。"""
+
+    space: str
+    premultiplied: list[list[float]]  # 两边预乘 alpha 后的坐标（含 alpha）
+    hue_fixup: Optional[str] = None  # 极坐标空间的 hue 弧线修正说明
+    missing_hue: Optional[str] = None  # 无彩色一侧借用另一侧 hue 的说明
+    mixed_coords: list[float]  # 插值并还原 alpha 后的目标空间坐标
+
+
+class ColorMixResponse(BaseModel):
+    space: str
+    hue_interpolation: Optional[str] = None
+    weights: ColorMixWeightsOut
+    conversions: list[ColorMixConvertOut]
+    interpolation: ColorMixInterpolationOut
+    back_convert_steps: list[str] = Field(default_factory=list)
+    coords: list[float]  # 结果在目标插值空间内的坐标（展示单位）
+    rgba: ColorMixRgbaOut

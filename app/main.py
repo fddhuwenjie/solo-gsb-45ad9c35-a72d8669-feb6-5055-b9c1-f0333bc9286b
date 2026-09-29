@@ -4,11 +4,14 @@ from __future__ import annotations
 from fastapi import FastAPI, HTTPException
 
 from .engine import compute
+from .color_mix import ColorMixError, mix_colors
 from .counters import CounterRenderError, render_counter_tree
 from .grid_tracks import GridTracksError, solve_grid_tracks
 from .keyframe import KeyframeValidationError, sample_keyframes
 from .math_eval import MathEvaluationError, evaluate_math
 from .models import (
+    ColorMixRequest,
+    ColorMixResponse,
     ComputeRequest,
     ComputeResponse,
     CounterRenderRequest,
@@ -30,8 +33,8 @@ app = FastAPI(
     version="1.0.0",
     description="CSS 层叠解释 API：按来源 / 层 / important / 特异性 / 源码次序计算声明胜出者，"
     "解析自定义属性与 var()，并给出逐步淘汰证据；另含选择器可命中性判断、"
-    " CSS 数值属性关键帧采样、CSS 计数器元素树渲染、CSS 数学表达式求值与"
-    " 单行 CSS Grid 列宽求解。",
+    " CSS 数值属性关键帧采样、CSS 计数器元素树渲染、CSS 数学表达式求值、"
+    " 单行 CSS Grid 列宽求解与 CSS Color 两色混合。",
 )
 
 
@@ -96,4 +99,18 @@ def grid_tracks_endpoint(req: GridTracksRequest) -> GridTracksResponse:
     try:
         return solve_grid_tracks(req)
     except GridTracksError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@app.post("/color-mix", response_model=ColorMixResponse)
+def color_mix_endpoint(req: ColorMixRequest) -> ColorMixResponse:
+    """按 CSS Color 规则混合两种颜色：解析 hex / rgb() / hsl()，补全并归一化
+    权重（权重和低于 100% 同比缩小结果 alpha），先转换到 srgb /
+    srgb-linear / hsl / oklab / oklch 插值空间，通道预乘 alpha 后插值，
+    极坐标空间按 shorter / longer / increasing / decreasing 处理 hue 弧线，
+    无彩色一侧借用另一侧 hue，转回 sRGB 后逐通道裁剪，返回最终 rgba、
+    目标空间坐标与权重、转换及插值轨迹。"""
+    try:
+        return mix_colors(req)
+    except ColorMixError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
